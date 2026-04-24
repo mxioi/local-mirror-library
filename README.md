@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Local Mirror Library logo" width="128" />
+</p>
+
 # Local Mirror Library
 
 [![CI](https://github.com/mxioi/local-mirror-library/actions/workflows/ci.yml/badge.svg)](https://github.com/mxioi/local-mirror-library/actions/workflows/ci.yml)
