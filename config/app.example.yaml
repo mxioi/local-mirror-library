@@ -1,0 +1,27 @@
+paths:
+  db: wikipedia-local/library.db
+  config: wikipedia-pages.json
+  manifest: wikipedia-local/manifest.json
+  output_root: wikipedia-local
+  log: wikipedia-local/archive.log
+
+server:
+  host: 0.0.0.0
+  port: 8010
+  library_port: 8080
+  library_home_url: http://localhost:8080/Local%20Mirror%20Library.html
+  frontend_api_base: ""
+  allowed_origins:
+    - http://localhost:8080
+    - http://127.0.0.1:8080
+
+auth:
+  session_hours: 12
+  bootstrap_admin_password: ""
+  ad_server: ad.example.local
+  ad_domain: example.local
+  ad_use_ssl: false
+
+limits:
+  max_jobs_age_days: 30
+  max_db_size_mb: 500

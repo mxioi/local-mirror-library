@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+wikipedia-local/
+en.wikipedia.org/
+
+.DS_Store
+Thumbs.db
+
+.env
+config/app.yaml
+.venv/

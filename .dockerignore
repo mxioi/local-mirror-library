@@ -1,0 +1,9 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+wikipedia-local/*.db-wal
+wikipedia-local/*.db-shm

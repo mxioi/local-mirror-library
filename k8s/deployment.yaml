@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: archive-app
+  namespace: local-mirror
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: archive-app
+  template:
+    metadata:
+      labels:
+        app: archive-app
+    spec:
+      containers:
+        - name: backend
+          image: local-mirror:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "archive_backend.py", "--serve", "--settings", "config/app.yaml", "--env-file", ".env"]
+          ports:
+            - containerPort: 8010
+              name: api
+          envFrom:
+            - secretRef:
+                name: archive-secrets
+          volumeMounts:
+            - name: archive-data
+              mountPath: /app/wikipedia-local
+            - name: config-volume
+              mountPath: /app/config/app.yaml
+              subPath: app.yaml
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: api
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+
+        - name: frontend
+          image: local-mirror:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/app"]
+          ports:
+            - containerPort: 8080
+              name: web
+          volumeMounts:
+            - name: archive-data
+              mountPath: /app/wikipedia-local
+          readinessProbe:
+            tcpSocket:
+              port: web
+            initialDelaySeconds: 8
+            periodSeconds: 10
+
+      volumes:
+        - name: archive-data
+          persistentVolumeClaim:
+            claimName: archive-data
+        - name: config-volume
+          configMap:
+            name: archive-config

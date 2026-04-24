@@ -1,0 +1,37 @@
+services:
+  backend:
+    build: .
+    container_name: archive-backend
+    restart: unless-stopped
+    command: ["python", "archive_backend.py", "--serve", "--settings", "config/app.yaml", "--env-file", ".env"]
+    env_file:
+      - .env
+    ports:
+      - "8010:8010"
+    volumes:
+      - archive_data:/app/wikipedia-local
+      - archive_config:/app/config
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8010/api/v1/health', timeout=5).status==200 else 1)"]
+      interval: 20s
+      timeout: 8s
+      retries: 6
+      start_period: 25s
+
+  frontend:
+    build: .
+    container_name: archive-frontend
+    restart: unless-stopped
+    command: ["python", "-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/app"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - archive_data:/app/wikipedia-local
+      - archive_config:/app/config
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  archive_data:
+  archive_config:
