@@ -294,6 +294,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "items", "deleted_at_utc", "TEXT")
     _ensure_column(conn, "items", "deleted_reason", "TEXT")
     _ensure_column(conn, "items", "updated_at_utc", "TEXT")
+    _ensure_column(conn, "items", "parent", "TEXT")
     _ensure_column(conn, "user_profiles", "password_hash", "TEXT")
     _ensure_column(conn, "user_profiles", "api_key_hash", "TEXT")
     _ensure_column(conn, "user_profiles", "auth_source", "TEXT NOT NULL DEFAULT 'local'")
@@ -377,6 +378,7 @@ def load_pages_from_config(config_path: Path) -> list[dict[str, Any]]:
                 "tags": tags,
                 "source_type": str(row.get("source_type", "wikipedia")).strip().lower() or "wikipedia",
                 "source_url": str(row.get("source_url", "")).strip(),
+                "parent": str(row.get("parent", "")).strip(),
             }
         )
     return pages
@@ -573,6 +575,7 @@ def sync_from_files(
             )
 
         update_item_search_row(conn, key, page["title"], oldid, source_url or "")
+        conn.execute("UPDATE items SET parent = ? WHERE normalized_title = ?", (page.get("parent") or None, key))
 
         conn.execute("DELETE FROM item_tags WHERE item_id = ?", (item_id,))
         for tag_name in page["tags"]:
@@ -908,7 +911,15 @@ def perform_job_action(job_type: str, payload: dict[str, Any], config_path: Path
     import mirror_wikipedia_pages as mirror
 
     if job_type == "add_url":
-        return mirror.execute_gui_action("add_url", str(payload.get("url", "")), config_path=config_path, output_root=output_root)
+        return mirror.execute_gui_action(
+            "add_url",
+            str(payload.get("url", "")),
+            config_path=config_path,
+            output_root=output_root,
+            follow_links=bool(payload.get("follow_links", False)),
+            link_limit=int(payload.get("link_limit", 25) or 25),
+            selected_urls=payload.get("selected_urls"),
+        )
     if job_type == "mirror_title":
         return mirror.execute_gui_action("only_title", str(payload.get("title", "")), config_path=config_path, output_root=output_root)
     if job_type == "mirror_url":
@@ -972,7 +983,7 @@ def release_deferred_jobs(conn: sqlite3.Connection) -> int:
             "INSERT INTO audit_events(actor, role, action, target_type, target_ref, result, metadata_json, created_at_utc) VALUES ('system', 'admin', 'jobs.deferred.release', 'job', '*', 'ok', ?, ?)",
             (json.dumps({"count": int(n)}), now),
         )
-        conn.commit()
+    conn.commit()
     return int(n or 0)
 
 
@@ -1120,6 +1131,12 @@ def query_items(
     if tag:
         clauses.append("EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id AND t.name = ?)")
         params.append(tag)
+    if status != "deleted":
+        # One row per page: older snapshots of the same title are reachable via the item timeline.
+        clauses.append(
+            "i.id = (SELECT i2.id FROM items i2 WHERE i2.title = i.title AND i2.status != 'deleted' "
+            "ORDER BY CAST(COALESCE(i2.oldid, '0') AS INTEGER) DESC, i2.id DESC LIMIT 1)"
+        )
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -1152,6 +1169,7 @@ def query_items(
           i.output_path,
           i.file_size_bytes,
           i.updated_at_utc,
+          i.parent,
           c.name AS collection,
           (SELECT GROUP_CONCAT(t.name, ',') FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id) AS tags_csv
         FROM items i
@@ -1288,6 +1306,9 @@ def create_app(db_path: Path, config_path: Path, manifest_path: Path, output_roo
 
     class ActionUrlRequest(BaseModel):
         url: str = Field(min_length=1, max_length=500)
+        follow_links: bool = False
+        link_limit: int = Field(default=25, ge=1, le=100)
+        selected_urls: list[str] | None = Field(default=None, max_length=100)
 
     class ActionTitleRequest(BaseModel):
         title: str = Field(min_length=1, max_length=250)
@@ -1937,7 +1958,27 @@ def create_app(db_path: Path, config_path: Path, manifest_path: Path, output_roo
 
     @app.post("/api/v1/actions/add-url")
     def action_add_url(request: Request, payload: ActionUrlRequest) -> dict[str, Any]:
-        return enqueue_action(request, "add_url", {"url": payload.url.strip()})
+        return enqueue_action(request, "add_url", {
+            "url": payload.url.strip(),
+            "follow_links": payload.follow_links,
+            "link_limit": payload.link_limit,
+            "selected_urls": payload.selected_urls,
+        })
+
+    @app.get("/api/v1/links/preview")
+    def links_preview(request: Request, url: str = Query(..., min_length=1, max_length=500)) -> dict[str, Any]:
+        conn = connect_db(db_path)
+        try:
+            require_auth(conn, request, "operator")
+        finally:
+            conn.close()
+        import mirror_wikipedia_pages as mirror
+
+        try:
+            links = mirror.preview_follow_links(url.strip())
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not fetch page: {exc}") from exc
+        return {"links": links}
 
     @app.post("/api/v1/actions/mirror-one")
     def action_mirror_one(request: Request, payload: ActionTitleRequest) -> dict[str, Any]:

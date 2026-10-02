@@ -19,8 +19,17 @@ function mapItemStatus(s) {
   return s || "queued";
 }
 
+// output_path is a container filesystem path (/app/...); the frontend serves /app as its web root.
+function toLocalHref(outputPath) {
+  if (!outputPath) return "";
+  const p = String(outputPath).replace(/\\/g, "/");
+  if (/^https?:\/\//i.test(p)) return p;
+  if (p.startsWith("/app/")) return p.slice(4);
+  return p.startsWith("/") ? p : "/" + p;
+}
+
 function normPage(item) {
-  const localHref = item.output_path || "";
+  const localHref = toLocalHref(item.output_path);
   const sourceUrl = item.source_url || "";
   const host = item.source_host || (sourceUrl ? (() => { try { return new URL(sourceUrl).host; } catch { return "unknown"; } })() : "unknown");
   return {
@@ -42,6 +51,7 @@ function normPage(item) {
     change_count: item.change_count || 0,
     last_run: item.last_run || null,
     local_href: localHref || null,
+    parent: item.parent || null,
     audit: item.audit || [],
     timeline: Array.isArray(item.timeline)
       ? item.timeline.map((t) => ({
@@ -49,7 +59,7 @@ function normPage(item) {
           oldid: t.oldid || null,
           archived_at_utc: t.archived_at_utc || null,
           status: mapItemStatus(t.status),
-          local_href: t.output_path || null,
+          local_href: toLocalHref(t.output_path) || null,
           is_current: !!t.is_current,
           file_size_bytes: t.file_size_bytes || 0,
         }))
@@ -876,7 +886,7 @@ function App() {
   }, [connected, authToken, role, loadPages, loadFacets, loadHistory, loadAdminSystem]);
 
   // Run an operation ------------------------------------------------
-  const runAction = useCallback(async (action, value) => {
+  const runAction = useCallback(async (action, value, opts = {}) => {
     if (action === "focus_add") {
       setOpsOpen(true);
       toast("Focus the Add URL field in the Operations console.", "info");
@@ -889,7 +899,7 @@ function App() {
     }
 
     const map = {
-      add_url: ["/actions/add-url", { url: value }],
+      add_url: ["/actions/add-url", { url: value, ...opts }],
       only_title: ["/actions/mirror-one", { title: value }],
       only_url: ["/actions/mirror-by-url", { url: value }],
       refresh_one: ["/actions/refresh-one", { title: value }],
@@ -915,6 +925,11 @@ function App() {
       toast(`Action failed: ${err.message}`, "err");
     }
   }, [connected, role, authedApi, loadJobs, loadPages, loadFacets, loadHistory, loadAdminSystem, toast]);
+
+  const previewLinks = useCallback(async (url) => {
+    const res = await authedApi(`/links/preview?url=${encodeURIComponent(url)}`);
+    return Array.isArray(res.links) ? res.links : [];
+  }, [authedApi]);
 
   // Keyboard: ⌘K for palette --------------------------------------
   useEffect(() => {
@@ -1454,6 +1469,7 @@ function App() {
             jobs={jobs}
             historyRows={historyRows}
             onRun={runAction}
+            onPreviewLinks={previewLinks}
             role={role}
             connected={connected}
             adminUsers={adminUsers}

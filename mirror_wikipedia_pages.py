@@ -33,11 +33,7 @@ def fetch_with_type(url: str) -> tuple[bytes, str | None]:
 
 
 def guess_extension(url: str, content_type: str | None) -> str:
-    parsed = urllib.parse.urlparse(url)
-    ext = Path(parsed.path).suffix
-    if ext:
-        return ext
-
+    # Prefer the served content type: URLs like load.php?image=... carry a misleading suffix.
     if content_type:
         ct = content_type.lower().split(";")[0].strip()
         if ct == "text/css":
@@ -56,6 +52,11 @@ def guess_extension(url: str, content_type: str | None) -> str:
             return ".woff2"
         if ct == "font/woff":
             return ".woff"
+
+    parsed = urllib.parse.urlparse(url)
+    ext = Path(parsed.path).suffix
+    if ext and ext.lower() not in (".php", ".asp", ".aspx", ".jsp", ".cgi"):
+        return ext
 
     return ".bin"
 
@@ -156,7 +157,8 @@ def rewrite_css(css_text: str, css_url: str, mapping: dict[str, str]) -> str:
         raw = match.group(1).strip().strip('"\'')
         resolved = normalize_url(css_url, raw)
         if resolved in mapping:
-            return f'url("{mapping[resolved]}")'
+            # CSS files live in assets/ alongside the files they reference
+            return f'url("{Path(mapping[resolved]).name}")'
         return match.group(0)
 
     return re.sub(r'url\(([^)]+)\)', repl, css_text, flags=re.I)
@@ -192,12 +194,28 @@ def local_href_for_wikipedia_target(
     return href
 
 
+def local_href_for_generic_target(
+    resolved_url: str,
+    current_page: dict[str, str],
+    url_lookup: dict[str, dict[str, str]],
+) -> str | None:
+    target = url_lookup.get(normalize_page_url(resolved_url))
+    if target is None:
+        return None
+    fragment = urllib.parse.urlparse(resolved_url).fragment
+    if target["slug"] == current_page["slug"]:
+        return f"#{fragment}" if fragment else "index.html"
+    href = f"../{target['slug']}/index.html"
+    return f"{href}#{fragment}" if fragment else href
+
+
 def rewrite_html(
     html_text: str,
     base_url: str,
     mapping: dict[str, str],
     current_page: dict[str, str],
     local_page_lookup: dict[str, list[dict[str, str]]],
+    url_lookup: dict[str, dict[str, str]] | None = None,
 ) -> str:
     def replace_attr(match: re.Match[str]) -> str:
         attr = match.group(1)
@@ -216,10 +234,19 @@ def rewrite_html(
             if local_href:
                 return f'{attr}="{local_href}"'
 
+            if url_lookup:
+                generic_href = local_href_for_generic_target(resolved, current_page, url_lookup)
+                if generic_href:
+                    return f'{attr}="{generic_href}"'
+
             parsed = urllib.parse.urlparse(resolved)
             if parsed.netloc == "en.wikipedia.org" and (
                 parsed.path.startswith("/wiki/") or parsed.path == "/w/index.php"
             ):
+                return f'{attr}="{resolved}"'
+
+            # Pages that were not mirrored: link to the live site instead of a dead relative path.
+            if url_lookup is not None and not value.strip().startswith("#") and resolved.startswith(("http://", "https://")):
                 return f'{attr}="{resolved}"'
 
         return match.group(0)
@@ -333,14 +360,85 @@ def infer_source_type_from_url(url: str) -> str:
 
 def title_from_generic_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
-    path = parsed.path.strip("/")
-    if not path:
-        return parsed.netloc or "remote-page"
-    name = path.split("/")[-1] or parsed.netloc or "remote-page"
-    name = urllib.parse.unquote(name)
-    name = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name)
-    name = re.sub(r"[^A-Za-z0-9_\-]+", "_", name).strip("_")
-    return name or "remote-page"
+    host = parsed.netloc.lower() or "remote-page"
+    path = urllib.parse.unquote(parsed.path).strip("/")
+    path = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", path)
+    path = re.sub(r"[^A-Za-z0-9_\-./]+", "_", path).strip("_/")
+    return f"{host}/{path}" if path else host
+
+
+def normalize_page_url(url: str) -> str:
+    """Scheme-less comparison key for a page URL: lower-case host, no query or fragment, no trailing index page or slash."""
+    parsed = urllib.parse.urlparse(url)
+    path = re.sub(r"/index\.html?$", "", parsed.path)
+    return f"{parsed.netloc.lower()}{path}".rstrip("/")
+
+
+WIKI_SKIP_NAMESPACES = {
+    "special", "help", "file", "image", "media", "talk", "category", "template", "wikipedia",
+    "portal", "user", "draft", "module", "mediawiki", "timedtext", "book", "wp", "wt",
+}
+PAGE_EXTENSIONS = {"", ".html", ".htm", ".php", ".asp", ".aspx"}
+MAX_LINK_LIMIT = 100
+
+
+def _wikipedia_body(html_text: str) -> str:
+    start = html_text.find('id="mw-content-text"')
+    body = html_text[start:] if start >= 0 else html_text
+    end = body.find('id="References"')
+    return body[:end] if end >= 0 else body
+
+
+def extract_follow_links(html_text: str, page_url: str, source_type: str) -> list[dict[str, str]]:
+    """Qualifying one-level links on a page, in page order, de-duplicated."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    page_key = normalize_page_url(page_url)
+
+    if source_type == "wikipedia":
+        current, _, _ = extract_wikipedia_target(page_url)
+        current_key = normalize_title_key(current or "")
+        for raw in re.findall(r'href=["\']([^"\']+)["\']', _wikipedia_body(html_text), flags=re.I):
+            resolved = normalize_url(page_url, raw)
+            parsed = urllib.parse.urlparse(resolved)
+            if parsed.netloc != "en.wikipedia.org" or not parsed.path.startswith("/wiki/"):
+                continue
+            title = urllib.parse.unquote(parsed.path[len("/wiki/"):]).replace(" ", "_")
+            prefix = title.split(":", 1)[0].casefold() if ":" in title else ""
+            if not title or prefix in WIKI_SKIP_NAMESPACES or prefix.endswith("_talk"):
+                continue
+            key = normalize_title_key(title)
+            if key == current_key or key in seen:
+                continue
+            seen.add(key)
+            out.append({"url": f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title, safe='_():,.-')}", "title": title})
+        return out
+
+    base = urllib.parse.urlparse(page_url)
+    folder = base.path if base.path.endswith("/") else base.path.rsplit("/", 1)[0] + "/"
+    for raw in re.findall(r'href=["\']([^"\']+)["\']', clean_generic_html(html_text), flags=re.I):
+        resolved = normalize_url(page_url, raw)
+        parsed = urllib.parse.urlparse(resolved)
+        if parsed.netloc.lower() != base.netloc.lower() or not parsed.path.startswith(folder):
+            continue
+        if Path(parsed.path).suffix.lower() not in PAGE_EXTENSIONS:
+            continue
+        clean = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        key = normalize_page_url(clean)
+        if key == page_key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"url": clean, "title": title_from_generic_url(clean)})
+    return out
+
+
+def choose_links(candidates: list[dict[str, str]], link_limit: int, selected_urls: list[str] | None) -> list[dict[str, str]]:
+    """First N candidates, or the selected ones (only if they are real candidates), in page order."""
+    if selected_urls is not None:
+        wanted = {normalize_page_url(u) for u in selected_urls}
+        return [c for c in candidates if normalize_page_url(c["url"]) in wanted][:MAX_LINK_LIMIT]
+    limit = max(1, min(MAX_LINK_LIMIT, int(link_limit)))
+    return candidates[:limit]
 
 
 def extract_title_oldid_from_url(url: str) -> tuple[str, str | None]:
@@ -384,6 +482,27 @@ def extract_title_oldid_from_url(url: str) -> tuple[str, str | None]:
             oldid = None
 
     return title, oldid
+
+
+def fetch_latest_revision(title: str) -> tuple[str, str]:
+    """Latest (title, revid) for an article, following redirects to the target article."""
+    api_url = (
+        "https://en.wikipedia.org/w/api.php?action=query&prop=revisions&rvprop=ids&redirects=1&titles="
+        f"{urllib.parse.quote(title, safe='')}&format=json"
+    )
+    req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    pages = payload.get("query", {}).get("pages", {})
+    if not isinstance(pages, dict) or not pages:
+        raise ValueError(f"Could not resolve oldid for title: {title}")
+    page = next(iter(pages.values()))
+    revisions = page.get("revisions")
+    if not revisions or not isinstance(revisions, list) or revisions[0].get("revid") is None:
+        raise ValueError(f"No revisions found for title: {title}")
+    resolved_title = str(page.get("title") or title).replace(" ", "_")
+    return resolved_title, str(revisions[0]["revid"])
 
 
 def fetch_latest_oldid(title: str) -> str:
@@ -463,37 +582,92 @@ def upsert_page_config_entry(
     return "added", new_item
 
 
-def add_url_to_config(config_path: Path, url: str, update_existing: bool) -> tuple[str, str, str]:
+def resolve_url_entry(url: str) -> dict[str, str]:
     try:
         title, oldid = extract_title_oldid_from_url(url)
-        source_type = "wikipedia"
-        source_url = ""
-        if not oldid:
-            oldid = fetch_latest_oldid(title)
-    except Exception:
-        title = title_from_generic_url(url)
-        oldid = None
-        source_type = infer_source_type_from_url(url)
-        source_url = url
+    except ValueError:
+        return {"title": title_from_generic_url(url), "oldid": "", "source_type": infer_source_type_from_url(url), "source_url": url}
+    # A Wikipedia URL: lookup failures propagate instead of producing a bogus generic entry.
+    if not oldid:
+        title, oldid = fetch_latest_revision(title)
+    return {"title": title, "oldid": oldid, "source_type": "wikipedia", "source_url": ""}
 
+
+def remove_config_titles(config_path: Path, titles: list[str]) -> None:
+    keys = {normalize_title_key(t) for t in titles}
+    if not keys:
+        return
+    config = load_config(config_path)
+    config["pages"] = [
+        p for p in config.get("pages", [])
+        if not (isinstance(p, dict) and normalize_title_key(str(p.get("title", ""))) in keys)
+    ]
+    save_config(config_path, config)
+
+
+def _find_config_item(config: dict, title: str) -> dict | None:
+    key = normalize_title_key(title)
+    for item in config.get("pages", []):
+        if isinstance(item, dict) and normalize_title_key(str(item.get("title", ""))) == key:
+            return item
+    return None
+
+
+def add_url_to_config(config_path: Path, url: str, update_existing: bool) -> tuple[str, str, str]:
+    entry = resolve_url_entry(url)
     config = load_config(config_path)
     action, _ = upsert_page_config_entry(
         config=config,
-        title=title,
-        oldid=oldid or "",
+        title=entry["title"],
+        oldid=entry["oldid"],
         update_existing=update_existing,
     )
-    pages = config.get("pages", []) if isinstance(config, dict) else []
-    if isinstance(pages, list):
-        key = normalize_title_key(title)
-        for item in pages:
-            if isinstance(item, dict) and normalize_title_key(str(item.get("title", ""))) == key:
-                item["source_type"] = source_type
-                if source_url:
-                    item["source_url"] = source_url
-                break
+    item = _find_config_item(config, entry["title"])
+    if item is not None:
+        item["source_type"] = entry["source_type"]
+        if entry["source_url"]:
+            item["source_url"] = entry["source_url"]
     save_config(config_path, config)
-    return action, title, oldid or ""
+    return action, entry["title"], entry["oldid"]
+
+
+def set_follow_options(config_path: Path, title: str, link_limit: int) -> None:
+    config = load_config(config_path)
+    item = _find_config_item(config, title)
+    if item is not None:
+        item["follow_links"] = True
+        item["link_limit"] = max(1, min(MAX_LINK_LIMIT, int(link_limit)))
+        save_config(config_path, config)
+
+
+def add_child_to_config(config_path: Path, url: str, parent: str) -> str | None:
+    """Add a pulled-in page (never followed further). Existing entries are left untouched."""
+    try:
+        entry = resolve_url_entry(url)
+    except Exception:
+        return None
+    config = load_config(config_path)
+    existing = _find_config_item(config, entry["title"])
+    if existing is not None:
+        return str(existing["title"])
+    item: dict = {"title": entry["title"], "oldid": entry["oldid"], "source_type": entry["source_type"],
+                  "parent": parent, "follow_links": False}
+    if entry["source_url"]:
+        item["source_url"] = entry["source_url"]
+    config.setdefault("pages", []).append(item)
+    save_config(config_path, config)
+    return entry["title"]
+
+
+def _page_url_for_entry(entry: dict[str, str]) -> str:
+    return entry["source_url"] or build_source_url(entry["title"], entry["oldid"] or None)
+
+
+def preview_follow_links(url: str) -> list[dict[str, str]]:
+    entry = resolve_url_entry(url)
+    page_url = _page_url_for_entry(entry)
+    data, _ = fetch_with_type(page_url)
+    return extract_follow_links(data.decode("utf-8", errors="replace"), page_url, entry["source_type"])
 
 
 def refresh_config_oldids(config_path: Path) -> int:
@@ -592,12 +766,23 @@ def build_page_lookup(entries: list[dict[str, str]]) -> dict[str, list[dict[str,
     return lookup
 
 
+def build_url_lookup(entries: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Non-Wikipedia pages keyed by normalize_page_url(source_url)."""
+    lookup: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        if entry.get("source_type", "wikipedia") == "wikipedia" or not entry.get("source_url"):
+            continue
+        lookup[normalize_page_url(entry["source_url"])] = entry
+    return lookup
+
+
 def mirror_page(
     page: dict[str, str],
     output_root: Path,
     all_pages: list[dict[str, str]],
     local_page_lookup: dict[str, list[dict[str, str]]],
     library_home_url: str,
+    url_lookup: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, str]:
     title = page["title"]
     oldid = page["oldid"] or None
@@ -676,6 +861,7 @@ def mirror_page(
         mapping=mapping,
         current_page=page,
         local_page_lookup=local_page_lookup,
+        url_lookup=url_lookup,
     )
     rewritten_html = inject_navigation_overlay(
         html_text=rewritten_html,
@@ -722,6 +908,7 @@ def load_page_specs(config_path: Path) -> list[dict[str, str]]:
                 "collection": collection,
                 "source_type": source_type,
                 "source_url": source_url,
+                "parent": str(item.get("parent", "")).strip(),
             }
         )
 
@@ -1104,10 +1291,12 @@ def run_mirror(
     clean: bool,
     only_title_keys: set[str] | None,
     library_home_url: str,
-) -> None:
+    tolerate_failure_keys: set[str] | None = None,
+) -> list[str]:
     page_specs = load_page_specs(config_path)
     all_pages = build_page_entries(page_specs)
     local_page_lookup = build_page_lookup(all_pages)
+    url_lookup = build_url_lookup(all_pages)
 
     selected_pages = all_pages
     if only_title_keys is not None:
@@ -1124,16 +1313,46 @@ def run_mirror(
     run_timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     mirrored_keys = {page["key"] for page in selected_pages}
 
-    for page in selected_pages:
-        oldid = page["oldid"]
-        print(f"Mirroring: {page['title']}" + (f" (oldid {oldid})" if oldid else ""))
+    tolerate = tolerate_failure_keys or set()
+    # Pulled-in pages first, so a failed one can be dropped from the lookups before its parent is rendered.
+    ordered = sorted(selected_pages, key=lambda p: 0 if p["key"] in tolerate else 1)
+    skipped: list[str] = []
+    done_tolerated: list[dict[str, str]] = []
+
+    def _mirror(page: dict[str, str]) -> None:
         mirror_page(
             page=page,
             output_root=output_root,
             all_pages=all_pages,
             local_page_lookup=local_page_lookup,
             library_home_url=library_home_url,
+            url_lookup=url_lookup,
         )
+
+    for page in ordered:
+        oldid = page["oldid"]
+        print(f"Mirroring: {page['title']}" + (f" (oldid {oldid})" if oldid else ""))
+        try:
+            _mirror(page)
+            if page["key"] in tolerate:
+                done_tolerated.append(page)
+        except Exception as exc:
+            if page["key"] not in tolerate:
+                raise
+            print(f"Skipped {page['title']}: {exc}")
+            skipped.append(page["title"])
+            mirrored_keys.discard(page["key"])
+            local_page_lookup.pop(page["key"], None)
+            for url_key in [k for k, v in url_lookup.items() if v["key"] == page["key"]]:
+                url_lookup.pop(url_key)
+
+    # Pulled-in pages rendered before a sibling failed may still link to it locally; render them again.
+    if skipped:
+        for page in done_tolerated:
+            try:
+                _mirror(page)
+            except Exception as exc:
+                print(f"Re-render failed for {page['title']}: {exc}")
 
     manifest: list[dict[str, str]] = []
     for page in all_pages:
@@ -1162,6 +1381,7 @@ def run_mirror(
 
     print(f"Saved mirrors to: {output_root.resolve()}")
     print("Serve locally with: python -m http.server 8080")
+    return skipped
 
 
 def execute_gui_action(
@@ -1170,20 +1390,47 @@ def execute_gui_action(
     config_path: Path,
     output_root: Path,
     library_home_url: str = DEFAULT_LIBRARY_HOME_URL,
+    follow_links: bool = False,
+    link_limit: int = 25,
+    selected_urls: list[str] | None = None,
 ) -> str:
     value = value.strip()
 
     if action == "add_url":
         if not value:
             raise ValueError("URL is required.")
-        _, title, _ = add_url_to_config(config_path=config_path, url=value, update_existing=True)
-        run_mirror(
+        _, title, oldid = add_url_to_config(config_path=config_path, url=value, update_existing=True)
+        keys = {normalize_title_key(title)}
+        children: set[str] = set()
+        existing_keys = {
+            normalize_title_key(str(p.get("title", "")))
+            for p in load_config(config_path).get("pages", []) if isinstance(p, dict)
+        }
+        if follow_links:
+            set_follow_options(config_path, title, link_limit)
+            entry = resolve_url_entry(value) if not oldid else {"title": title, "oldid": oldid, "source_type": "wikipedia", "source_url": ""}
+            page_url = _page_url_for_entry(entry)
+            data, _ = fetch_with_type(page_url)
+            candidates = extract_follow_links(data.decode("utf-8", errors="replace"), page_url, entry["source_type"])
+            for link in choose_links(candidates, link_limit, selected_urls):
+                child_title = add_child_to_config(config_path, link["url"], parent=title)
+                if child_title:
+                    children.add(normalize_title_key(child_title))
+            children.discard(normalize_title_key(title))
+            keys |= children
+        skipped = run_mirror(
             config_path=config_path,
             output_root=output_root,
             clean=False,
-            only_title_keys={normalize_title_key(title)},
+            only_title_keys=keys,
             library_home_url=library_home_url,
+            tolerate_failure_keys=children,
         )
+        # Newly added pages that could not be downloaded are not kept (they would break "Refresh all").
+        remove_config_titles(config_path, [t for t in skipped if normalize_title_key(t) not in existing_keys])
+        if follow_links:
+            summary = f"Added/updated and mirrored: {title} + {len(children) - len(skipped)} linked page(s), {len(skipped)} skipped"
+            return summary + (f": {', '.join(skipped)}" if skipped else "")
         return f"Added/updated and mirrored: {title}"
 
     if action == "only_title":

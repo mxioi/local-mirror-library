@@ -69,6 +69,7 @@ function Drawer({ page, onClose, onRun, role, onAddTag, onRemoveTag, onDeleteIte
                 <dt>oldid</dt>             <dd><code>{page.oldid || "— (latest pin not set)"}</code></dd>
                 <dt>Archived</dt>          <dd>{fmtFull(page.archived_at_utc)} <span style={{color:"var(--ink-faint)"}}>({fmtAgo(page.archived_at_utc)})</span></dd>
                 <dt>Source URL</dt>        <dd><a href={page.source_url} target="_blank" rel="noopener" style={{color:"var(--accent-ink)"}}>{page.source_url}</a></dd>
+                {page.parent && (<><dt>Pulled in from</dt><dd>{page.parent}</dd></>)}
                 <dt>Checksum</dt>          <dd><code>{page.checksum || "—"}</code></dd>
                 <dt>Size</dt>              <dd>{fmtBytes(page.size_bytes)}</dd>
                 <dt>Retention</dt>         <dd>{page.retention}</dd>
@@ -175,7 +176,7 @@ function Drawer({ page, onClose, onRun, role, onAddTag, onRemoveTag, onDeleteIte
 }
 
 // ---------- operations console ----------
-function Ops({ jobs, historyRows, onRun, role, connected, adminUsers, onUpsertUser, onDeleteUser, onIssueUserApiKey, onChangeOwnPassword, onResetUserPassword, onRetryJob, onCancelJob, onGetJobDetail, adminSystem, onRefreshAdminSystem, onAdminSync, onAdminCleanup, onExportHistoryCsv, onRetryAllFailedJobs, adminLogs, onRefreshAdminLogs, authSource, onClose, activeTab, onTabChange }) {
+function Ops({ jobs, historyRows, onRun, onPreviewLinks, role, connected, adminUsers, onUpsertUser, onDeleteUser, onIssueUserApiKey, onChangeOwnPassword, onResetUserPassword, onRetryJob, onCancelJob, onGetJobDetail, adminSystem, onRefreshAdminSystem, onAdminSync, onAdminCleanup, onExportHistoryCsv, onRetryAllFailedJobs, adminLogs, onRefreshAdminLogs, authSource, onClose, activeTab, onTabChange }) {
   const [tabState, setTabState] = useState("run");
   const tab = activeTab || tabState;
   const setTab = (next) => {
@@ -202,7 +203,7 @@ function Ops({ jobs, historyRows, onRun, role, connected, adminUsers, onUpsertUs
         <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>History</button>
       </div>
       <div className="ops-body">
-        {tab === "run" && <RunTab onRun={onRun} canEdit={canEdit} role={role} connected={connected} adminUsers={adminUsers} onUpsertUser={onUpsertUser} onDeleteUser={onDeleteUser} onIssueUserApiKey={onIssueUserApiKey} onChangeOwnPassword={onChangeOwnPassword} onResetUserPassword={onResetUserPassword} authSource={authSource} adminSystem={adminSystem} onRefreshAdminSystem={onRefreshAdminSystem} onAdminSync={onAdminSync} onAdminCleanup={onAdminCleanup} adminLogs={adminLogs} onRefreshAdminLogs={onRefreshAdminLogs} />}
+        {tab === "run" && <RunTab onRun={onRun} onPreviewLinks={onPreviewLinks} canEdit={canEdit} role={role} connected={connected} adminUsers={adminUsers} onUpsertUser={onUpsertUser} onDeleteUser={onDeleteUser} onIssueUserApiKey={onIssueUserApiKey} onChangeOwnPassword={onChangeOwnPassword} onResetUserPassword={onResetUserPassword} authSource={authSource} adminSystem={adminSystem} onRefreshAdminSystem={onRefreshAdminSystem} onAdminSync={onAdminSync} onAdminCleanup={onAdminCleanup} adminLogs={adminLogs} onRefreshAdminLogs={onRefreshAdminLogs} />}
         {tab === "jobs" && <JobsTab jobs={jobs} canEdit={canEdit} onRetryJob={onRetryJob} onCancelJob={onCancelJob} onGetJobDetail={onGetJobDetail} onRetryAllFailedJobs={onRetryAllFailedJobs} />}
         {tab === "history" && <HistoryTab jobs={jobs} historyRows={historyRows} onExportHistoryCsv={onExportHistoryCsv} />}
       </div>
@@ -222,19 +223,44 @@ function OpBlock({ title, hint, children, locked }) {
   );
 }
 
-function RunTab({ onRun, canEdit, role, connected, adminUsers, onUpsertUser, onDeleteUser, onIssueUserApiKey, onChangeOwnPassword, onResetUserPassword, authSource, adminSystem, onRefreshAdminSystem, onAdminSync, onAdminCleanup, adminLogs, onRefreshAdminLogs }) {
+function RunTab({ onRun, onPreviewLinks, canEdit, role, connected, adminUsers, onUpsertUser, onDeleteUser, onIssueUserApiKey, onChangeOwnPassword, onResetUserPassword, authSource, adminSystem, onRefreshAdminSystem, onAdminSync, onAdminCleanup, adminLogs, onRefreshAdminLogs }) {
   const [addUrl, setAddUrl] = useState("");
   const [onlyTitle, setOnlyTitle] = useState("");
   const [onlyUrl, setOnlyUrl] = useState("");
   const [refreshOne, setRefreshOne] = useState("");
+  const [followLinks, setFollowLinks] = useState(false);
+  const [linkLimit, setLinkLimit] = useState(25);
+  const [linkChoices, setLinkChoices] = useState(null); // null = auto (first N); array = checklist
+  const [linkBusy, setLinkBusy] = useState(false);
+
+  const loadLinkChoices = async () => {
+    if (!addUrl || !onPreviewLinks) return;
+    setLinkBusy(true);
+    try {
+      const links = await onPreviewLinks(addUrl);
+      setLinkChoices(links.map((l, i) => ({ ...l, checked: i < linkLimit })));
+    } catch (err) {
+      setLinkChoices([]);
+    } finally {
+      setLinkBusy(false);
+    }
+  };
+
+  const submitAdd = () => {
+    const opts = followLinks
+      ? { follow_links: true, link_limit: linkLimit,
+          ...(linkChoices ? { selected_urls: linkChoices.filter((c) => c.checked).map((c) => c.url) } : {}) }
+      : {};
+    go("add_url", addUrl, () => { setAddUrl(""); setLinkChoices(null); }, opts);
+  };
   const [newUser, setNewUser] = useState("");
   const [newRole, setNewRole] = useState("viewer");
   const [oldPassword, setOldPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
 
-  const go = (action, value, reset) => {
+  const go = (action, value, reset, opts) => {
     if (!canEdit) return;
-    onRun(action, value);
+    onRun(action, value, opts);
     reset && reset();
   };
 
@@ -262,10 +288,44 @@ function RunTab({ onRun, canEdit, role, connected, adminUsers, onUpsertUser, onD
               disabled={!canEdit}
             />
             <button className="btn primary" disabled={!canEdit || !addUrl}
-              onClick={() => go("add_url", addUrl, () => setAddUrl(""))}>
+              onClick={submitAdd}>
               <Icon d={IC.plus} /> Add
             </button>
           </div>
+          <div className="row" style={{gap: 12, alignItems: "center", marginTop: 8}}>
+            <label style={{display: "flex", gap: 6, alignItems: "center"}}>
+              <input type="checkbox" checked={followLinks} disabled={!canEdit}
+                onChange={(e) => { setFollowLinks(e.target.checked); setLinkChoices(null); }} />
+              Also grab linked pages
+            </label>
+            {followLinks && (
+              <>
+                <label style={{display: "flex", gap: 6, alignItems: "center"}}>
+                  Limit
+                  <input type="number" min="1" max="100" value={linkLimit} style={{width: 64}}
+                    onChange={(e) => setLinkLimit(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} />
+                </label>
+                <button className="btn sm" disabled={!canEdit || !addUrl || linkBusy} onClick={loadLinkChoices}>
+                  {linkBusy ? "Loading…" : "Choose links…"}
+                </button>
+              </>
+            )}
+          </div>
+          {followLinks && linkChoices && (
+            <div style={{maxHeight: 220, overflow: "auto", border: "1px solid var(--line)", borderRadius: 6, padding: 8, marginTop: 8}}>
+              {linkChoices.length === 0 && <div style={{color: "var(--ink-faint)", fontSize: 12}}>No qualifying links found.</div>}
+              {linkChoices.map((c, i) => (
+                <label key={c.url} style={{display: "flex", gap: 6, fontSize: 12, alignItems: "center"}}>
+                  <input type="checkbox" checked={c.checked}
+                    onChange={(e) => setLinkChoices((prev) => prev.map((p, j) => j === i ? { ...p, checked: e.target.checked } : p))} />
+                  <span title={c.url}>{c.title}</span>
+                </label>
+              ))}
+              <div style={{fontSize: 12, color: "var(--ink-faint)", marginTop: 6}}>
+                {linkChoices.filter((c) => c.checked).length} of {linkChoices.length} selected (max 100)
+              </div>
+            </div>
+          )}
         </div>
       </OpBlock>
 
